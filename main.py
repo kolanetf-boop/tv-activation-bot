@@ -1,23 +1,25 @@
 import os
 import asyncio
 import json
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+import time
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from playwright.async_api import async_playwright
 
 # --- الإعدادات المتغيرة والمفاتيح ---
-TOKEN = os.getenv("BOT_TOKEN", "ضع_التوكن_الخاص_بك_هنا")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # رقم الـ ID الخاص بك على تليجرام
+TOKEN = os.getenv("BOT_TOKEN", "ضع_التوكن_هنا")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 LINKS_FILE = "links.txt"
 DATA_FILE = "bot_data.json"
+SIGNATURE = "\n\n🌐 *By: LanGoos*"
 
-# --- إدارة حفظ البيانات (المحظورين + الحسابات الممتلئة مؤقتاً) ---
+# --- إدارة البيانات ---
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"banned_users": [], "full_links": {}}
+    return {"banned_users": [], "full_accounts": []}
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -29,241 +31,219 @@ def get_links():
     with open(LINKS_FILE, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
 
-# --- وظيفة إرسال تنبيهات للأدمن ---
-async def notify_admin(context: ContextTypes.DEFAULT_TYPE, message: str):
-    if ADMIN_ID != 0:
-        try:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=f"🔔 **تنبيه الإدارة:**\n{message}", parse_mode="Markdown")
-        except Exception as e:
-            print(f"Error sending admin notification: {e}")
+def save_links(links):
+    with open(LINKS_FILE, "w", encoding="utf-8") as f:
+        for link in links:
+            f.write(f"{link}\n")
 
-# --- الأوامر الرئيسية ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 **أهلاً بك في بوت تفعيل الشاشات الذكي!**\n\n"
-        "📺 **للتفعيل:** أرسل الأمر متبوعاً بكود الشاشة (8 أرقام):\n"
-        "`/login 12345678`\n\n"
-        "⚙️ **للأدمن:**\n"
-        "• `/addlinks`: لرفع ملف الروابط\n"
-        "• `/stats`: لإحصائيات البوت\n"
-        "• `/banned`: لمشاهدة المحظورين\n"
-        "• `/unban USER_ID`: لإلغاء حظر صديق",
-        parse_mode="Markdown"
+# --- دالة دمج ورسم شريط التقدم التفاعلي ---
+def generate_progress_bar(percent: int, status_text: str, start_time: float, current_acc: int, total_accs: int) -> str:
+    filled_length = int(10 * percent // 100)
+    bar = "█" * filled_length + "░" * (10 - filled_length)
+    
+    elapsed_seconds = int(time.time() - start_time)
+    
+    return (
+        f"⏳ **جاري معالجة طلب التفعيل...**\n\n"
+        f"`[{bar}]` **{percent}%**\n\n"
+        f"📌 **الحالة:** {status_text}\n"
+        f"👤 **الحساب الحالي:** {current_acc} من {total_accs}\n"
+        f"⏱ **الوقت المنقضي:** {elapsed_seconds} ثانية"
     )
 
-# 1. رفع ملف الروابط (للأدمن)
-async def add_links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ عذراً، هذا الأمر مخصص للمشرف فقط!")
-        return
-    await update.message.reply_text("📥 يرجى إرسال ملف `.txt` يحتوي على الروابط الآن.")
-    context.user_data['awaiting_file'] = True
+# --- محرك التفعيل بواسطة Playwright مع التحديث التفاعلي ---
+async def try_activate_tv(url: str, code: str, update_progress_cb, start_time: float, acc_idx: int, total_accs: int) -> bool:
+    async with async_playwright() as p:
+        await update_progress_cb(20, "🌐 جاري فتح المتصفح والاتصال بالرابط...", start_time, acc_idx, total_accs)
+        
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720}
+        )
+        page = await context.new_page()
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID or not context.user_data.get('awaiting_file'):
-        return
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(1000)
 
-    file = await update.message.document.get_file()
-    await file.download_to_drive(LINKS_FILE)
-    context.user_data['awaiting_file'] = False
-    
-    links = get_links()
-    await update.message.reply_text(f"✅ تم تحديث قائمة الروابط بنجاح!\nعدد الروابط المتاحة: {len(links)}")
-    await notify_admin(context, f"تم رفع ملف روابط جديد يحتوي على **{len(links)}** رابط.")
+            await update_progress_cb(50, "⌨️ تم فتح الصفحة، جاري كتابة كود التفعيل...", start_time, acc_idx, total_accs)
+            
+            input_selector = 'input[type="text"], input[name*="code"], input[id*="code"], input'
+            await page.wait_for_selector(input_selector, timeout=15000)
+            
+            input_element = page.locator(input_selector).first
+            await input_element.click()
+            await input_element.fill("")
+            await input_element.type(code, delay=100)
+            await page.wait_for_timeout(1000)
 
-# 2. أمر التفعيل التلقائي /login
-async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+            await update_progress_cb(80, "🔄 تم إدخال الكود، جاري إرسال الطلب والتحقق...", start_time, acc_idx, total_accs)
+            
+            submit_button = page.locator('button[type="submit"], input[type="submit"], button:has-text("Continue"), button:has-text("موافق"), button:has-text("تفعيل"), button').first
+            if await submit_button.is_visible():
+                await submit_button.click()
+            else:
+                await page.keyboard.press("Enter")
+
+            await page.wait_for_timeout(4000)
+
+            content = await page.content()
+            error_indicators = ["incorrect", "invalid", "منتهي", "خطأ", "غير صحيح", "expired"]
+            
+            for err in error_indicators:
+                if err in content.lower():
+                    await browser.close()
+                    return False
+
+            await browser.close()
+            return True
+
+        except Exception as e:
+            print(f"Error on {url}: {e}")
+            await browser.close()
+            return False
+
+# --- أوامر التليجرام ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     data = load_data()
 
-    # فحص الحظر
-    if user.id in data["banned_users"]:
-        await update.message.reply_text("⛔ أنت محظور مؤقتاً من استخدام البوت لعدم تأكيد نتيجة التفعيل السابقة خلال 5 دقائق.")
+    if user_id in data["banned_users"]:
+        await update.message.reply_text("❌ أنت محظور من استخدام هذا البوت.")
+        return
+
+    welcome_msg = (
+        "👋 **أهلاً بك في بوت تفعيل TV**\n\n"
+        "لطلب تفعيل الشاشة، أرسل الأمر التالي:\n"
+        "`/login 12345678` (مع استبدال الرقم بكود الشاشة الخاص بك)\n\n"
+        "🛠 **للأدمن:** يمكنك رفع ملف `.txt` يضم الروابط المتاحة."
+        f"{SIGNATURE}"
+    )
+    await update.message.reply_text(welcome_msg, parse_mode="Markdown")
+
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    data = load_data()
+
+    if user_id in data["banned_users"]:
+        await update.message.reply_text("❌ أنت محظور من استخدام البوت.")
         return
 
     if not context.args:
-        await update.message.reply_text("⚠️ يرجى كتابة كود التفعيل المكون من 8 أرقام، مثال:\n`/login 12345678`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ يرجى إدخال الكود مع الأمر، مثال:\n`/login 69246469`", parse_mode="Markdown")
         return
 
-    tv_code = context.args[0]
+    code = context.args[0]
     links = get_links()
 
     if not links:
-        await update.message.reply_text("❌ لا توجد روابط متاحة حالياً، يرجى التواصل مع المشرف.")
+        await update.message.reply_text("⚠️ لا توجد روابط تفعيل متاحة حالياً. يرجى التواصل مع الإدارة.")
         return
 
-    msg = await update.message.reply_text("⏳ جاري بدء محرك الأتمتة وتجربة الحسابات...")
+    start_time = time.time()
+    total_accs = len(links)
 
-    successful_link = None
-    failed_reason = None
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        # محاكاة متصفح حقيقي لتفادي الحظر (Anti-Bot)
-        browser_context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
-        )
-        page = await browser_context.new_page()
-
-        for idx, link in enumerate(links, 1):
-            await msg.edit_text(f"🔄 جاري محاولة التفعيل على الحساب رقم ({idx}/{len(links)})... ⏳")
-            
-            try:
-                # الانتقال للرابط
-                response = await page.goto(link, timeout=12000)
-                await asyncio.sleep(2)
-
-                # فحص انتهاء الصلاحية
-                content = await page.content()
-                if "login" in page.url.lower() or "expired" in content.lower():
-                    await notify_admin(context, f"⚠️ **الرابط رقم {idx} منتهي الصلاحية!**\nيرجى تجديده.")
-                    continue
-
-                # تعبئة كود الـ 8 أرقام
-                await page.fill("input[type='text'], input[name='code']", tv_code)
-                await page.click("button[type='submit']")
-                await asyncio.sleep(4)
-
-                # فحص امتلاء الحساب بشاشات
-                page_text = await page.content()
-                if "too many screens" in page_text.lower() or "limit" in page_text.lower():
-                    await notify_admin(context, f"ℹ️ **الحساب رقم {idx} ممتلئ حالياً بالشاشات.** (تم تخطيه تلقائياً).")
-                    continue
-
-                # إذا نجحت العملية
-                successful_link = idx
-                break
-
-            except Exception as e:
-                continue
-
-        await browser.close()
-
-    if successful_link:
-        keyboard = [
-            [
-                InlineKeyboardButton("🟢 تم التفعيل وتعمل الشاشة", callback_data=f"ok_{user.id}_{successful_link}"),
-                InlineKeyboardButton("🔴 لم تعمل الشاشة", callback_data=f"fail_{user.id}_{successful_link}")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await msg.edit_text(
-            f"🎉 **تمت محاولة التفعيل على الحساب رقم {successful_link}!**\n\n"
-            "⚠️ **تنبيه هام:** يرجى تأكيد النتيجة بالضغط على أحد الأزرار أسفله خلال **5 دقائق** وإلا سيتم حظرك تلقائياً من البوت.",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
-
-        # تنبيه الأدمن ببدء العملية
-        await notify_admin(context, f"👤 قام المستخدم [{user.full_name}](tg://user?id={user.id}) بالتفعيل على الحساب رقم **{successful_link}** (في انتظار تأكيده).")
-
-        # تشغيل مؤقت الـ 5 دقائق
-        asyncio.create_task(start_feedback_timer(context, user.id, msg.message_id, update.effective_chat.id, user.full_name))
-    else:
-        await msg.edit_text("❌ فشلت المحاولة على جميع الحسابات المتاحة. قد تكون الروابط منتهية أو الأرقام خاطئة.")
-
-# --- نظام التقييم والحظر التلقائي ---
-
-async def start_feedback_timer(context, user_id, message_id, chat_id, user_name):
-    await asyncio.sleep(300) # 5 دقائق
-
-    responded = context.bot_data.get("responded_users", set())
-    if user_id not in responded:
-        # إضافة المستخدم لقائمة المحظورين
-        data = load_data()
-        if user_id not in data["banned_users"]:
-            data["banned_users"].append(user_id)
-            save_data(data)
-
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="⛔ **تم حظرك مؤقتاً!**\nانتهت مهلة الـ 5 دقائق دون تأكيد نتيجة التفعيل.",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-
-        # إرسال إشعار فوري للأدمن
-        await notify_admin(context, f"🚫 **حظر تلقائي:** تم حظر المستخدم [{user_name}](tg://user?id={user_id}) لعدم التجاوب خلال 5 دقائق.")
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data_code = query.data
-    user_id = query.from_user.id
-
-    if "responded_users" not in context.bot_data:
-        context.bot_data["responded_users"] = set()
-    context.bot_data["responded_users"].add(user_id)
-
-    if data_code.startswith("ok_"):
-        link_num = data_code.split("_")[2]
-        await query.edit_message_text("✅ شكراً لتأكيدك! مشاهدة ممتعة 🍿")
-        await notify_admin(context, f"🟢 أكّد المستخدم [{query.from_user.full_name}](tg://user?id={user_id}) أن التفعيل **نجح بنجاح** على الحساب {link_num}.")
-
-    elif data_code.startswith("fail_"):
-        link_num = data_code.split("_")[2]
-        await query.edit_message_text("⚠️ تم تسليم إبلاغك للمشرف لفحص الحساب.")
-        await notify_admin(context, f"🔴 أبلغ المستخدم [{query.from_user.full_name}](tg://user?id={user_id}) أن التفعيل **فشل** على الحساب {link_num}!")
-
-# --- الأوامر الإدارية (Admin Commands) ---
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    links = get_links()
-    data = load_data()
-    await update.message.reply_text(
-        f"📊 **إحصائيات البوت الحالية:**\n\n"
-        f"🔗 عدد الروابط المتاحة: `{len(links)}`\n"
-        f"⛔ عدد المحظورين حالياً: `{len(data['banned_users'])}`",
+    status_msg = await update.message.reply_text(
+        generate_progress_bar(5, "🚀 جاري بدء العملية...", start_time, 1, total_accs),
         parse_mode="Markdown"
     )
 
-async def banned_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    data = load_data()
-    banned = data.get("banned_users", [])
-    if not banned:
-        await update.message.reply_text("✅ لا يوجد أي مستخدم محظور حالياً.")
-    else:
-        text = "⛔ **قائمة المحظورين (IDs):**\n" + "\n".join([f"• `{uid}`" for uid in banned])
-        await update.message.reply_text(text, parse_mode="Markdown")
+    async def update_progress(percent: int, status_text: str, s_time: float, acc_idx: int, t_accs: int):
+        try:
+            text = generate_progress_bar(percent, status_text, s_time, acc_idx, t_accs)
+            await status_msg.edit_text(text, parse_mode="Markdown")
+        except Exception:
+            pass
 
-async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    success = False
+    full_accounts = data.get("full_accounts", [])
+
+    for idx, link in enumerate(links, start=1):
+        if link in full_accounts:
+            continue
+
+        is_activated = await try_activate_tv(link, code, update_progress, start_time, idx, total_accs)
+        
+        if is_activated:
+            success = True
+            break
+        else:
+            if idx < total_accs:
+                await update_progress(10, f"❌ فشل الحساب {idx}.. جاري الانتقال للحساب التالي...", start_time, idx + 1, total_accs)
+                await asyncio.sleep(1)
+
+    elapsed = int(time.time() - start_time)
+
+    if success:
+        final_text = (
+            f"🎉 **تم تفعيل الشاشة بنجاح!**\n\n"
+            f"`[██████████]` **100%**\n\n"
+            f"🔑 **الكود:** `{code}`\n"
+            f"⏱ **الوقت الإجمالي:** {elapsed} ثانية"
+            f"{SIGNATURE}"
+        )
+        await status_msg.edit_text(final_text, parse_mode="Markdown")
+    else:
+        fail_text = (
+            f"❌ **فشلت عملية التفعيل.**\n\n"
+            f"قد تكون جميع الروابط المتاحة ممتلئة، الكود خاطئ، أو انتهت صلاحية الجلسة.\n"
+            f"⏱ **الوقت المستغرق:** {elapsed} ثانية"
+            f"{SIGNATURE}"
+        )
+        await status_msg.edit_text(fail_text, parse_mode="Markdown")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔️ هذا الأمر مخصص للأدمن فقط.")
         return
-    if not context.args:
-        await update.message.reply_text("⚠️ يرجى كتابة الـ ID للمستخدم، مثال:\n`/unban 123456789`", parse_mode="Markdown")
+
+    document = update.message.document
+    if not document.file_name.endswith(".txt"):
+        await update.message.reply_text("⚠️ يرجى رفع ملف بصيغة `.txt` فقط.")
         return
-    
-    target_id = int(context.args[0])
-    data = load_data()
-    if target_id in data["banned_users"]:
-        data["banned_users"].remove(target_id)
+
+    file = await context.bot.get_file(document.file_id)
+    file_path = "temp_links.txt"
+    await file.download_to_drive(file_path)
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        new_links = [line.strip() for line in f if line.strip()]
+
+    os.remove(file_path)
+
+    if new_links:
+        save_links(new_links)
+        data = load_data()
+        data["full_accounts"] = []
         save_data(data)
-        await update.message.reply_text(f"✅ تم إلغاء حظر المستخدم `{target_id}` بنجاح!", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("⚠️ هذا المستخدم غير موجود في قائمة الحظر.")
 
-# --- تشغيل البوت ---
+        await update.message.reply_text(
+            f"✅ **تم تحديث قائمة الروابط بنجاح!**\n"
+            f"عدد الروابط المتاحة: **{len(new_links)}**"
+            f"{SIGNATURE}",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("⚠️ الملف المرفوع فارغ.")
+
 def main():
+    if TOKEN == "ضع_التوكن_هنا" or not TOKEN:
+        print("❌ خطأ: لم يتم ضبط BOT_TOKEN بشكل صحيح!")
+        return
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addlinks", add_links_command))
     app.add_handler(CommandHandler("login", login_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("banned", banned_command))
-    app.add_handler(CommandHandler("unban", unban_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(CallbackQueryHandler(button_callback))
 
-    print("🚀 البوت يعمل ومستعد لاستقبال الأوامر...")
+    print("🚀 البوت يعمل ومستعد لاستقبال الأوامر... [By: LanGoos]")
     app.run_polling()
 
 if __name__ == "__main__":
