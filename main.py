@@ -7,10 +7,12 @@ automatic TV activation through configurable links.
 Features
 --------
 - /start, /login <code>, /stats, /unban (admin)
+- /debug <code> (admin): single attempt with screenshot — diagnoses failures
 - Admin uploads `links.txt` to update activation URLs
 - Interactive progress bar with throttled edits (Telegram rate-limit safe)
 - 5-minute confirm window; auto-ban (5 days) if user doesn't reply
 - Per-link success/fail statistics with "By: LanGoos" signature
+- Smart success detection: URL change + DOM markers + HTTP response + no errors
 - Single shared Playwright instance (no per-call spin-up), robust
   try/finally cleanup, defensive error handling
 - File-level asyncio.Lock to keep bot_data.json consistent
@@ -25,17 +27,20 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse, urlunparse
 
 from playwright.async_api import (
     Browser,
     BrowserContext,
     Page,
     Playwright,
+    Response,
     async_playwright,
 )
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -63,36 +68,40 @@ log = logging.getLogger("langoos")
 
 
 # =====================================================================
-# Config
+# Config — reads BOT_TOKEN and ADMIN_ID from env or defaults
 # =====================================================================
 @dataclass(frozen=True)
 class Config:
-    """Central configuration. Pull from env, fall back to safe defaults."""
-
     token: str
     admin_id: int
 
     links_file: Path = Path("links.txt")
     data_file: Path = Path("bot_data.json")
+    screenshots_dir: Path = Path("screenshots")
 
     signature: str = "\n\n🌐 *By: LanGoos*"
 
-    confirm_timeout_seconds: int = 300
-    ban_duration_seconds: int = 5 * 24 * 3600
+    confirm_timeout_seconds: int = 300          # 5 minutes
+    ban_duration_seconds: int = 5 * 24 * 3600   # 5 days
 
     progress_min_interval: float = 1.5
     progress_max_interval: float = 4.0
 
     page_load_timeout_ms: int = 30_000
     input_selector_timeout_ms: int = 15_000
-    post_submit_wait_ms: int = 4_000
+    post_submit_wait_ms: int = 6_000
+    post_submit_settle_ms: int = 2_500
 
     @classmethod
     def from_env(cls) -> "Config":
-        token = os.getenv("BOT_TOKEN", "").strip()
-        admin_id_raw = os.getenv("ADMIN_ID", "0").strip()
-        if not token or token == "ضع_التوكن_هنا":
-            raise RuntimeError("❌ BOT_TOKEN is not configured. Set it in env.")
+        default_token = "8777412311:AAEW32qe5Tf_X-5jpEH5PIMz8DYrinHVQOg"
+        default_admin_id = "6243526869"
+
+        token = os.getenv("BOT_TOKEN", default_token).strip()
+        admin_id_raw = os.getenv("ADMIN_ID", default_admin_id).strip()
+
+        if not token:
+            raise RuntimeError("❌ BOT_TOKEN is not configured.")
         try:
             admin_id = int(admin_id_raw)
         except ValueError as e:
@@ -101,10 +110,11 @@ class Config:
 
 
 CFG = Config.from_env()
+CFG.screenshots_dir.mkdir(parents=True, exist_ok=True)
 
 
 # =====================================================================
-# Data layer (file I/O with asyncio lock)
+# Data layer
 # =====================================================================
 class DataStore:
     DEFAULT: dict[str, Any] = {
@@ -242,6 +252,77 @@ def generate_progress_bar(
 
 
 # =====================================================================
+# Success / failure detection
+# =====================================================================
+SUCCESS_MARKERS_AR = (
+    "تم التفعيل", "تم بنجاح", "تم تفعيل", "نجح", "ناجح",
+    "تم الإضافة", "تم تسجيل", "تم القبول", "تم بنجاح ادخال",
+    "شكراً", "تم تأكيد", "تم بنجاح إرسال", "تم اضافة",
+    "تم اضافه", "تم الادخال", "تم إدخال", "كود صحيح", "تم بنجاح اضافه",
+)
+SUCCESS_MARKERS_EN = (
+    "success", "successfully", "activated", "activation successful",
+    "code accepted", "code valid", "device added", "device paired",
+    "registered", "linked", "ok", "done", "completed", "welcome",
+    "thank you", "congratulations", "approved", "accepted",
+)
+
+FAILURE_MARKERS_AR = (
+    "كود خاطئ", "كود غير صحيح", "كود منتهي", "كود غير صالح", "منتهي الصلاحية",
+    "خطأ", "غير صحيح", "غير صالح", "فشل", "غير موجود", "مستخدم",
+    "تم استخدام", "تم استعمال", "غير مصرح", "غير مسموح", "مكرر",
+)
+FAILURE_MARKERS_EN = (
+    "invalid", "incorrect", "expired", "used", "not found", "error",
+    "wrong", "denied", "unauthorized", "duplicate", "already",
+    "bad request", "fail", "failed", "try again",
+)
+
+
+def _normalize_url(u: str) -> str:
+    p = urlparse(u)
+    return urlunparse((p.scheme, p.netloc, p.path.rstrip("/"), p.params, p.query, ""))
+
+
+def _text_blob(page_text: str) -> str:
+    return re.sub(r"\s+", " ", (page_text or "").lower())
+
+
+async def _get_visible_text(page: Page) -> str:
+    try:
+        return await page.evaluate(
+            "() => document.body ? document.body.innerText : ''"
+        )
+    except Exception:
+        return ""
+
+
+def _check_failure(text: str) -> Optional[str]:
+    blob = _text_blob(text)
+    for m in FAILURE_MARKERS_AR + FAILURE_MARKERS_EN:
+        if m in blob:
+            return m
+    return None
+
+
+def _check_success(text: str) -> Optional[str]:
+    blob = _text_blob(text)
+    for m in SUCCESS_MARKERS_AR + SUCCESS_MARKERS_EN:
+        if m in blob:
+            return m
+    return None
+
+
+@dataclass
+class AttemptResult:
+    success: bool
+    reason: str
+    screenshot_path: Optional[Path] = None
+    final_url: str = ""
+    http_status: Optional[int] = None
+
+
+# =====================================================================
 # Playwright manager (singleton)
 # =====================================================================
 class PlaywrightManager:
@@ -320,11 +401,6 @@ PW = PlaywrightManager()
 # =====================================================================
 # Activation engine
 # =====================================================================
-ERROR_INDICATORS = (
-    "incorrect", "invalid", "منتهي", "خطأ", "غير صحيح", "expired", "error",
-)
-
-
 async def try_activate_tv(
     url: str,
     code: str,
@@ -332,56 +408,94 @@ async def try_activate_tv(
     start_time: float,
     acc_idx: int,
     total_accs: int,
-) -> bool:
+    *,
+    take_screenshot: bool = False,
+) -> AttemptResult:
     if PW._browser is None:
         await PW.start()
 
+    last_response: Optional[Response] = None
+    response_status: Optional[int] = None
+    initial_url: str = url
+
+    async def _capture_response(response: Response) -> None:
+        nonlocal last_response, response_status
+        if response.request.resource_type in ("document", "xhr", "fetch"):
+            last_response = response
+            response_status = response.status
+
+    screenshot_path: Optional[Path] = None
+    final_url: str = url
+    verdict_reason: str = "no-input"
+    success: bool = False
+
     try:
-        await update_progress_cb(20, "🌐 جاري الاتصال بالرابط...", start_time, acc_idx, total_accs)
+        await update_progress_cb(
+            20, "🌐 جاري الاتصال بالرابط...", start_time, acc_idx, total_accs
+        )
 
         async with PW.new_page() as (_ctx, page):
+            page.on("response", _capture_response)
+
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=CFG.page_load_timeout_ms)
+                await page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=CFG.page_load_timeout_ms,
+                )
             except Exception as e:
                 log.warning("goto failed for %s: %s", url, e)
-                return False
+                return AttemptResult(False, f"goto-failed:{e}", None, url, None)
 
             await page.wait_for_timeout(800)
+            initial_url = page.url
 
-            await update_progress_cb(50, "⌨️ تم فتح الصفحة، جاري كتابة الكود...", start_time, acc_idx, total_accs)
+            await update_progress_cb(
+                50, "⌨️ جاري كتابة الكود...", start_time, acc_idx, total_accs
+            )
 
             input_selectors = (
                 'input[type="text"]',
                 'input[name*="code" i]',
                 'input[id*="code" i]',
                 'input[type="search"]',
-                'input',
+                'input[type="tel"]',
+                'input[type="number"]',
+                'input:not([type="hidden"])',
             )
             input_el = None
             for sel in input_selectors:
                 try:
                     el = page.locator(sel).first
-                    await el.wait_for(state="visible", timeout=CFG.input_selector_timeout_ms // len(input_selectors))
+                    await el.wait_for(
+                        state="visible",
+                        timeout=CFG.input_selector_timeout_ms // len(input_selectors),
+                    )
                     if await el.is_visible():
                         input_el = el
                         break
                 except Exception:
                     continue
+
             if input_el is None:
-                log.info("No input found on %s", url)
-                return False
+                return AttemptResult(
+                    False, "no-input-field", None, page.url, response_status
+                )
 
             try:
                 await input_el.click()
                 await input_el.fill("")
                 await input_el.type(code, delay=80)
             except Exception as e:
-                log.warning("Typing failed on %s: %s", url, e)
-                return False
+                return AttemptResult(
+                    False, f"type-failed:{e}", None, page.url, response_status
+                )
 
             await page.wait_for_timeout(700)
 
-            await update_progress_cb(80, "🔄 جاري إرسال الطلب والتحقق...", start_time, acc_idx, total_accs)
+            await update_progress_cb(
+                80, "🔄 جاري إرسال الطلب...", start_time, acc_idx, total_accs
+            )
 
             submitted = False
             submit_selectors = (
@@ -391,6 +505,8 @@ async def try_activate_tv(
                 'button:has-text("موافق")',
                 'button:has-text("تفعيل")',
                 'button:has-text("OK")',
+                'button:has-text("Submit")',
+                'button:has-text("إرسال")',
                 'button',
             )
             for sel in submit_selectors:
@@ -406,28 +522,76 @@ async def try_activate_tv(
                 try:
                     await page.keyboard.press("Enter")
                 except Exception:
-                    return False
+                    return AttemptResult(
+                        False, "submit-failed", None, page.url, response_status
+                    )
 
             try:
-                await page.wait_for_load_state(
-                    "networkidle", timeout=CFG.post_submit_wait_ms
-                )
+                try:
+                    await page.wait_for_load_state(
+                        "networkidle", timeout=CFG.post_submit_wait_ms
+                    )
+                except Exception:
+                    pass
+                await page.wait_for_timeout(CFG.post_submit_settle_ms)
             except Exception:
-                await page.wait_for_timeout(CFG.post_submit_wait_ms)
+                pass
 
+            final_url = page.url
+
+            visible_text = await _get_visible_text(page)
+            html_content = ""
             try:
-                content = (await page.content()).lower()
+                html_content = (await page.content()).lower()
             except Exception:
-                content = ""
+                pass
 
-            for err in ERROR_INDICATORS:
-                if err in content:
-                    return False
-            return True
+            failure_match = _check_failure(visible_text)
+            success_match = _check_success(visible_text)
 
-    except Exception:
+            if failure_match:
+                verdict_reason = f"failure-marker:{failure_match}"
+                success = False
+            elif success_match:
+                verdict_reason = f"success-marker:{success_match}"
+                success = True
+            elif _normalize_url(final_url) != _normalize_url(initial_url):
+                verdict_reason = "url-changed"
+                success = True
+            elif response_status is not None and 200 <= response_status < 300:
+                if "error" in html_content or "خطأ" in html_content or "fail" in html_content:
+                    verdict_reason = "http-2xx-but-html-has-error"
+                    success = False
+                else:
+                    verdict_reason = f"http-{response_status}-no-error"
+                    success = True
+            else:
+                verdict_reason = "no-evidence-of-success"
+                success = False
+
+            if take_screenshot:
+                try:
+                    fname = (
+                        f"attempt_{int(time.time())}_{acc_idx}_"
+                        f"{'ok' if success else 'fail'}.png"
+                    )
+                    spath = CFG.screenshots_dir / fname
+                    await page.screenshot(path=str(spath), full_page=True)
+                    screenshot_path = spath
+                except Exception:
+                    log.exception("screenshot failed")
+
+            return AttemptResult(
+                success=success,
+                reason=verdict_reason,
+                screenshot_path=screenshot_path,
+                final_url=final_url,
+                http_status=response_status,
+            )
+
+    except Exception as e:
         log.exception("Unexpected error in try_activate_tv for %s", url)
-        return False
+        return AttemptResult(False, f"exception:{e}", None, final_url, response_status)
 
 
 # =====================================================================
@@ -550,25 +714,40 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     success = False
     used_link = ""
     failure_reason = ""
+    last_debug: Optional[AttemptResult] = None
 
     try:
         for idx, link in enumerate(links, start=1):
-            ok = await try_activate_tv(link, code, progress, start_time, idx, total)
-            if ok:
+            result = await try_activate_tv(
+                link, code, progress, start_time, idx, total,
+                take_screenshot=False,
+            )
+            last_debug = result
+            if result.success:
                 success = True
                 used_link = link
                 break
+            log.info(
+                "attempt %d/%d failed on %s: %s (status=%s)",
+                idx, total, link, result.reason, result.http_status,
+            )
             if idx < total:
                 await progress(
                     10,
-                    f"❌ فشل الحساب {idx}.. جاري الانتقال للتالي...",
+                    f"❌ فشل الحساب {idx} ({result.reason}).. التالي...",
                     start_time,
                     idx + 1,
                     total,
                 )
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(0.6)
         else:
-            failure_reason = "جميع الروابط رفضت الكود أو انتهت صلاحيتها."
+            if last_debug:
+                failure_reason = (
+                    f"جميع الروابط فشلت. آخر سبب: `{last_debug.reason}` "
+                    f"(HTTP {last_debug.http_status})"
+                )
+            else:
+                failure_reason = "جميع الروابط رفضت الكود."
     except Exception:
         log.exception("Unhandled error in /login")
         failure_reason = "حدث خطأ غير متوقع أثناء المعالجة."
@@ -626,7 +805,8 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         fail_text = (
             "❌ *فشلت عملية التفعيل.*\n\n"
             f"{failure_reason or 'قد تكون الروابط ممتلئة أو الكود غير صحيح.'}\n"
-            f"⏱ *الوقت المستغرق:* {elapsed} ثانية"
+            f"⏱ *الوقت المستغرق:* {elapsed} ثانية\n\n"
+            f"💡 للأدمن: شغّل `/debug {code}` لمشاهدة screenshot وحالة HTTP."
             f"{CFG.signature}"
         )
         try:
@@ -644,6 +824,69 @@ async def _keep_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None
         return
     except Exception:
         return
+
+
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != CFG.admin_id:
+        await update.message.reply_text("⛔️ هذا الأمر مخصص للأدمن فقط.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ الاستخدام: `/debug <code>`\nمثال: `/debug 69246469`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    code = context.args[0].strip()
+    if not code.isdigit():
+        await update.message.reply_text("⚠️ الكود يجب أن يكون أرقاماً فقط.")
+        return
+
+    links = await LINKS.read()
+    if not links:
+        await update.message.reply_text("⚠️ لا توجد روابط للاختبار.")
+        return
+
+    status = await update.message.reply_text(
+        "🔍 جاري تنفيذ محاولة واحدة وتسجيل screenshot...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    progress = ProgressEditor(status, time.time())
+    link = links[0]
+
+    result = await try_activate_tv(
+        link, code, progress, time.time(), 1, 1,
+        take_screenshot=True,
+    )
+
+    report = (
+        "🔬 *تقرير التشخيص*\n"
+        "───────────────────\n"
+        f"🔗 *الرابط:* `{link}`\n"
+        f"🔑 *الكود:* `{code}`\n"
+        f"📊 *HTTP Status:* `{result.http_status}`\n"
+        f"🌐 *URL النهائي:* `{result.final_url}`\n"
+        f"📝 *السبب:* `{result.reason}`\n"
+        f"✅ *النتيجة:* {'نجاح' if result.success else 'فشل'}"
+    )
+
+    try:
+        await status.edit_text(report, parse_mode=ParseMode.MARKDOWN)
+    except BadRequest:
+        await update.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
+
+    if result.screenshot_path and result.screenshot_path.exists():
+        try:
+            with result.screenshot_path.open("rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=result.screenshot_path.name,
+                    caption=f"📸 Screenshot — {result.reason}",
+                )
+        except Exception:
+            log.exception("Failed to send screenshot.")
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -860,13 +1103,20 @@ async def post_shutdown(app: Application) -> None:
 
 
 def build_app() -> Application:
-    app = Application.builder().token(CFG.token).post_init(post_init).post_shutdown(post_shutdown).build()
+    app = (
+        Application.builder()
+        .token(CFG.token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("login", login_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("stat", stats_cmd))
     app.add_handler(CommandHandler("unban", unban_cmd))
+    app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     return app
