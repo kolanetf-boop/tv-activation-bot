@@ -260,7 +260,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("banned", banned_command))
     app.add_handler(CommandHandler("unban", unban_command))
-    app.add_handler(MessageHandler(filters.DOCUMENT, handle_document))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(button_callback))
 
     print("🚀 البوت يعمل ومستعد لاستقبال الأوامر...")
