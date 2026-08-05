@@ -17,7 +17,7 @@ logging.basicConfig(
 )
 
 # --- إعدادات النظام ---
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"  # ضع توكن البوت الخاص بك هنا
+BOT_TOKEN = "8998319897:AAE1GVQ-gg7dtOYwZwhAC1NcxiPmbnZatqU"  # ضع توكن البوت الخاص بك هنا
 BATCH_SIZE = 10         # عدد الحسابات في الدفعة الواحدة
 TIMEOUT_SECONDS = 180   # مهلة الانتظار (3 دقائق = 180 ثانية)
 
