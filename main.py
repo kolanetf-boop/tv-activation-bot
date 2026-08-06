@@ -1,18 +1,8 @@
 """
-LanGoos TV Activation Bot - Integrated & Refined Edition
-=======================================================
+LanGoos TV Activation Bot
+=========================
 Telegram bot (python-telegram-bot v20+) + Playwright (Chromium) for
-automatic TV activation through configurable links with batch processing,
-auto-filtering of broken links, and interactive timeout confirmations.
-
-Features:
----------
-- Admin manages activation links via `links.txt` or uploading `.txt` files.
-- Batch processing: Tests 10 links at a time per batch.
-- Auto-filtering: Detects broken/unreachable links and preserves working links for future retries.
-- Instant stop on success with interactive Inline Buttons (✅ تم التفعيل / ❌ لم يتم التفعيل).
-- 3-Minute confirm window; auto-ban (5 days) if the user fails to confirm.
-- All original features retained: /start, /login <code>, /stats, /unban, /debug <code>, signature "By: LanGoos".
+automatic TV activation through configurable links.
 
 Author: LanGoos
 """
@@ -52,7 +42,7 @@ from telegram.ext import (
 from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError
 
 # =====================================================================
-# Logging Setup
+# Logging
 # =====================================================================
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -64,7 +54,7 @@ log = logging.getLogger("langoos")
 
 
 # =====================================================================
-# Configuration
+# Config
 # =====================================================================
 @dataclass(frozen=True)
 class Config:
@@ -77,9 +67,8 @@ class Config:
 
     signature: str = "\n\n🌐 *By: LanGoos*"
 
-    batch_size: int = 10                         # فحص 10 روابط في كل دفعة
-    confirm_timeout_seconds: int = 180           # 3 دقائق مهلة التأكيد
-    ban_duration_seconds: int = 5 * 24 * 3600    # حظر 5 أيام عند التجاهل
+    confirm_timeout_seconds: int = 180         # 3 دقائق مهلة الانتظار
+    ban_duration_seconds: int = 5 * 24 * 3600  # حظر 5 أيام عند عدم التفاعل
 
     progress_min_interval: float = 1.5
 
@@ -110,13 +99,13 @@ CFG.screenshots_dir.mkdir(parents=True, exist_ok=True)
 
 
 # =====================================================================
-# Data & Session Storage
+# Data Store
 # =====================================================================
 class DataStore:
     DEFAULT: dict[str, Any] = {
         "temp_banned": {},
         "link_stats": {},
-        "working_links": [],
+        "full_accounts": [],
     }
 
     def __init__(self, path: Path) -> None:
@@ -185,18 +174,9 @@ class LinkStore:
 DATA = DataStore(CFG.data_file)
 LINKS = LinkStore(CFG.links_file)
 
-# تخزين متزامن لجلسات المستخدمين الشغالة
-# user_sessions[user_id] = {
-#     "working_links": [...],
-#     "current_index": 0,
-#     "active_code": "...",
-#     "timeout_task": Task
-# }
-user_sessions: dict[int, dict[str, Any]] = {}
-
 
 # =====================================================================
-# Helpers
+# Helpers & UI Formatting
 # =====================================================================
 def _format_remaining(seconds: int) -> str:
     days, rem = divmod(max(0, seconds), 86400)
@@ -226,21 +206,22 @@ async def is_user_banned(user_id: int) -> tuple[bool, str]:
 
 def generate_progress_bar(
     percent: int,
-    status_text: str,
-    start_time: float,
-    current_acc: int,
-    total_accs: int,
+    is_done: bool,
+    current_idx: int,
+    total: int,
+    elapsed_sec: int,
 ) -> str:
     percent = max(0, min(100, percent))
     filled = int(10 * percent // 100)
     bar = "█" * filled + "░" * (10 - filled)
-    elapsed = int(time.time() - start_time)
+    status_icon = "✅" if is_done else "⏳"
+
     return (
         "⏳ *جاري فحص دفعة التفعيل...*\n\n"
         f"`[{bar}]` *{percent}%*\n\n"
-        f"📌 *الحالة:* {status_text}\n"
-        f"🔗 *الرابط الحالي:* {current_acc} من {total_accs}\n"
-        f"⏱ *الوقت المنقضي:* {elapsed} ثانية\n"
+        f"📌 *الحالة:* {status_icon}\n"
+        f"🔗 *الرابط الحالي:* {current_idx} من {total}\n"
+        f"⏱ *الوقت المنقضي:* {elapsed_sec} ثانية\n"
         "───────────────────\n"
         "⚠️ *تعليمات مهمة:*\n"
         "1️⃣ عند نجاح التفعيل، يرجى التأكيد خلال *3 دقائق* فقط.\n"
@@ -249,7 +230,7 @@ def generate_progress_bar(
 
 
 # =====================================================================
-# Markers & Url Normalization
+# Success / failure detection
 # =====================================================================
 SUCCESS_MARKERS_AR = (
     "تم التفعيل", "تم بنجاح", "تم تفعيل", "نجح", "ناجح",
@@ -310,16 +291,15 @@ def _check_success(text: str) -> Optional[str]:
 
 @dataclass
 class AttemptResult:
-    is_working: bool             # هل الرابط شغال وتجاوز مرحلة الاتصال وإدخال الكود؟
-    success: bool                # هل نجح التفعيل بواسطة الكود؟
-    reason: str                  # سبب النتيجة
+    success: bool
+    reason: str
     screenshot_path: Optional[Path] = None
     final_url: str = ""
     http_status: Optional[int] = None
 
 
 # =====================================================================
-# Playwright Manager (Singleton)
+# Playwright Manager
 # =====================================================================
 class PlaywrightManager:
     def __init__(self) -> None:
@@ -424,11 +404,10 @@ async def try_activate_tv(
     final_url: str = url
     verdict_reason: str = "no-input"
     success: bool = False
-    is_working: bool = False
 
     try:
         await update_progress_cb(
-            20, "🌐 جاري الاتصال بالرابط...", start_time, acc_idx, total_accs
+            20, False, start_time, acc_idx, total_accs
         )
 
         async with PW.new_page() as (_ctx, page):
@@ -442,13 +421,13 @@ async def try_activate_tv(
                 )
             except Exception as e:
                 log.warning("goto failed for %s: %s", url, e)
-                return AttemptResult(False, False, f"goto-failed:{e}", None, url, None)
+                return AttemptResult(False, f"goto-failed:{e}", None, url, None)
 
             await page.wait_for_timeout(800)
             initial_url = page.url
 
             await update_progress_cb(
-                50, "⌨️ جاري كتابة الكود...", start_time, acc_idx, total_accs
+                50, False, start_time, acc_idx, total_accs
             )
 
             input_selectors = (
@@ -475,13 +454,9 @@ async def try_activate_tv(
                     continue
 
             if input_el is None:
-                # لا يوجد مربع إدخال -> الرابط معطل أو غيّر تصميمه
                 return AttemptResult(
-                    False, False, "no-input-field", None, page.url, response_status
+                    False, "no-input-field", None, page.url, response_status
                 )
-
-            # وصول الرابط وإيجاد خانة الكود يعني أن الرابط شغال
-            is_working = True
 
             try:
                 await input_el.click()
@@ -489,13 +464,13 @@ async def try_activate_tv(
                 await input_el.type(code, delay=80)
             except Exception as e:
                 return AttemptResult(
-                    True, False, f"type-failed:{e}", None, page.url, response_status
+                    False, f"type-failed:{e}", None, page.url, response_status
                 )
 
             await page.wait_for_timeout(700)
 
             await update_progress_cb(
-                80, "🔄 جاري إرسال الطلب...", start_time, acc_idx, total_accs
+                80, False, start_time, acc_idx, total_accs
             )
 
             submitted = False
@@ -524,7 +499,7 @@ async def try_activate_tv(
                     await page.keyboard.press("Enter")
                 except Exception:
                     return AttemptResult(
-                        True, False, "submit-failed", None, page.url, response_status
+                        False, "submit-failed", None, page.url, response_status
                     )
 
             try:
@@ -583,7 +558,6 @@ async def try_activate_tv(
                     log.exception("screenshot failed")
 
             return AttemptResult(
-                is_working=is_working,
                 success=success,
                 reason=verdict_reason,
                 screenshot_path=screenshot_path,
@@ -593,25 +567,23 @@ async def try_activate_tv(
 
     except Exception as e:
         log.exception("Unexpected error in try_activate_tv for %s", url)
-        return AttemptResult(
-            False, False, f"exception:{e}", None, final_url, response_status
-        )
+        return AttemptResult(False, f"exception:{e}", None, final_url, response_status)
 
 
 # =====================================================================
-# Progress Editor
+# Throttled Progress Editor
 # =====================================================================
 class ProgressEditor:
     def __init__(self, message, start_time: float) -> None:
         self.message = message
         self.start_time = start_time
         self._last_edit_ts: float = 0.0
-        self._pending: Optional[tuple[int, str, int, int]] = None
+        self._pending: Optional[tuple[int, bool, int, int]] = None
         self._task: Optional[asyncio.Task] = None
 
-    async def __call__(self, percent: int, status: str, s_time: float, acc_idx: int, total: int) -> None:
+    async def __call__(self, percent: int, is_done: bool, s_time: float, acc_idx: int, total: int) -> None:
         now = time.time()
-        self._pending = (percent, status, acc_idx, total)
+        self._pending = (percent, is_done, acc_idx, total)
         if now - self._last_edit_ts >= CFG.progress_min_interval:
             await self._flush()
         else:
@@ -629,10 +601,11 @@ class ProgressEditor:
     async def _flush(self) -> None:
         if self._pending is None:
             return
-        percent, status, acc_idx, total = self._pending
+        percent, is_done, acc_idx, total = self._pending
         self._pending = None
         self._last_edit_ts = time.time()
-        text = generate_progress_bar(percent, status, self.start_time, acc_idx, total)
+        elapsed = int(time.time() - self.start_time)
+        text = generate_progress_bar(percent, is_done, acc_idx, total, elapsed)
         try:
             await self.message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
         except RetryAfter as e:
@@ -648,194 +621,7 @@ class ProgressEditor:
 
 
 # =====================================================================
-# Core Process: Batch Execution & Filtering
-# =====================================================================
-async def process_batch_activation(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int
-) -> None:
-    session = user_sessions.get(user_id)
-    if not session:
-        return
-
-    working_links = session["working_links"]
-    current_index = session["current_index"]
-
-    # التحقق مما إذا تم تجريب كافة الروابط الشغالة المتاحة
-    remaining_links = working_links[current_index:]
-    if not remaining_links:
-        db_data = await DATA.load()
-        all_saved = db_data.get("working_links", [])
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                f"❌ *انتهت جميع الروابط المتاحة ولم يتم التفعيل.*\n"
-                f"🔹 عدد الروابط الشغالة المحفوظة للاستخدام المستقبلي: `{len(all_saved)}`"
-                f"{CFG.signature}"
-            ),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        user_sessions.pop(user_id, None)
-        return
-
-    # اقتصاص دفعة من 10 روابط فقط
-    batch_to_test = remaining_links[: CFG.batch_size]
-    batch_total = len(batch_to_test)
-    start_time = time.time()
-
-    status_msg = await context.bot.send_message(
-        chat_id=user_id,
-        text=generate_progress_bar(5, "🚀 جاري بدء الدفعة...", start_time, 1, batch_total),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    progress = ProgressEditor(status_msg, start_time)
-    typing_task = asyncio.create_task(_keep_typing(context, update.effective_chat.id))
-
-    activation_success = False
-    successful_link = ""
-    last_reason = ""
-
-    try:
-        for idx, link in enumerate(batch_to_test, start=1):
-            result = await try_activate_tv(
-                link,
-                session["active_code"],
-                progress,
-                start_time,
-                idx,
-                batch_total,
-                take_screenshot=False,
-            )
-
-            # تصفية الروابط: حفظ الرابط الشغال وتجاهل المعطل
-            if result.is_working:
-                def _add_working(data: dict[str, Any]) -> None:
-                    wl = data.setdefault("working_links", [])
-                    if link not in wl:
-                        wl.append(link)
-                await DATA.update(_add_working)
-            else:
-                log.info("Removing/skipping broken link: %s", link)
-
-            if result.success:
-                activation_success = True
-                successful_link = link
-                break  # التوقف فوراً عند نجاح التفعيل
-
-            last_reason = result.reason
-            if idx < batch_total:
-                await progress(
-                    10,
-                    f"❌ فشل الرابط {idx}.. اختبار التالي...",
-                    start_time,
-                    idx + 1,
-                    batch_total,
-                )
-                await asyncio.sleep(0.5)
-
-    except Exception:
-        log.exception("Unhandled error in batch processing.")
-    finally:
-        typing_task.cancel()
-        await progress(100, "✅" if activation_success else "❌", start_time, batch_total, batch_total)
-
-    # تحديث المؤشر لبدء الدفعة التالية من النقطة الجديدة
-    session["current_index"] += len(batch_to_test)
-    elapsed = int(time.time() - start_time)
-
-    # --- الحالة الأولى: نجاح التفعيل أوتوماتيكياً برمجياً ---
-    if activation_success:
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "✅ تم التفعيل",
-                        callback_data=f"status_success|{user_id}|{successful_link}",
-                    ),
-                    InlineKeyboardButton(
-                        "❌ لم يتم التفعيل",
-                        callback_data=f"status_failed|{user_id}|{successful_link}",
-                    ),
-                ]
-            ]
-        )
-        msg_text = (
-            "🎯 *أظهر السكريبت أنه تم التفعيل بنجاح!*\n\n"
-            f"🔑 *الكود:* `{session['active_code']}`\n"
-            f"🔗 *الرابط الناجح:* `{successful_link}`\n"
-            f"⏱ *الوقت:* {elapsed} ثانية\n\n"
-            "⏰ *يرجى التأكيد بالضغط على أحد الأزرار أدناه خلال 3 دقائق:*\n"
-            "⚠️ (عدم التفاعل سيؤدي لحظر حسابك لمدة 5 أيام تلقائياً)"
-            f"{CFG.signature}"
-        )
-        try:
-            sent_msg = await status_msg.edit_text(
-                msg_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
-            )
-        except BadRequest:
-            sent_msg = await context.bot.send_message(
-                chat_id=user_id, text=msg_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
-            )
-
-        # تشغيل مؤقت الـ 3 دقائق مع الحظر التلقائي عند عدم الرد
-        timeout_task = asyncio.create_task(
-            handle_3min_timeout(context, user_id, sent_msg.message_id)
-        )
-        session["timeout_task"] = timeout_task
-
-    # --- الحالة الثانية: انتهت الـ 10 روابط دون تفعيل ---
-    else:
-        db_data = await DATA.load()
-        saved_count = len(db_data.get("working_links", []))
-        fail_text = (
-            f"⚠️ *لم يتم التفعيل في هذه الدفعة ({len(batch_to_test)} روابط).*\n"
-            f"🔹 إجمالي الروابط الشغالة المحفوظة: `{saved_count}`\n"
-            f"📝 آخر سبب: `{last_reason or 'رفض الكود'}`\n\n"
-            f"👉 يرجى **إعادة إرسال الكود** مرّة أخرى للبدء في فحص الدفعة التالية من الروابط."
-            f"{CFG.signature}"
-        )
-        try:
-            await status_msg.edit_text(fail_text, parse_mode=ParseMode.MARKDOWN)
-        except BadRequest:
-            await context.bot.send_message(
-                chat_id=user_id, text=fail_text, parse_mode=ParseMode.MARKDOWN
-            )
-
-
-# =====================================================================
-# Timeout Handler (3 Minutes)
-# =====================================================================
-async def handle_3min_timeout(context: ContextTypes.DEFAULT_TYPE, user_id: int, message_id: int):
-    try:
-        await asyncio.sleep(CFG.confirm_timeout_seconds)
-
-        # عند انقضاء الـ 3 دقائق بدون تفاعل يُحظر المستخدم 5 أيام
-        def _ban(data: dict[str, Any]) -> None:
-            data["temp_banned"][str(user_id)] = time.time() + CFG.ban_duration_seconds
-
-        await DATA.update(_ban)
-        user_sessions.pop(user_id, None)
-
-        ban_text = (
-            "🚫 *تم حظر هذا الحساب لمدة 5 أيام تلقائياً.*\n"
-            "السبب: عدم التأكيد خلال مهلة الـ 3 دقائق المحدد."
-            f"{CFG.signature}"
-        )
-        try:
-            await context.bot.edit_message_text(
-                chat_id=user_id,
-                message_id=message_id,
-                text=ban_text,
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            pass
-    except asyncio.CancelledError:
-        pass
-
-
-# =====================================================================
-# Commands Handlers
+# Commands
 # =====================================================================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -848,11 +634,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_text(
-        "👋 *أهلاً بك في بوت تفعيل TV الذكي*\n\n"
-        "لطلب تفعيل الشاشة، أرسل الأمر متبوعاً بالكود:\n"
+        "👋 *أهلاً بك في بوت تفعيل TV*\n\n"
+        "لطلب تفعيل الشاشة، أرسل الأمر:\n"
         "`/login 12345678`\n\n"
         "📊 *للإحصائيات:* `/stats`\n"
-        "🛠 *للأدمن:* ارفع ملف `.txt` لتحديث قائمة الروابط."
+        "🛠 *للأدمن:* ارفع ملف `.txt` لتحديث الروابط."
         f"{CFG.signature}",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -883,18 +669,8 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # إلغاء أي مؤقت سابق للمستخدم
-    if user_id in user_sessions and user_sessions[user_id].get("timeout_task"):
-        user_sessions[user_id]["timeout_task"].cancel()
-
-    db_data = await DATA.load()
-    saved_working = db_data.get("working_links", [])
-    file_links = await LINKS.read()
-
-    # اعتماد الروابط الشغالة المحفوظة مسبقاً، وإلا استخدام الروابط من الملف
-    base_links = saved_working if saved_working else file_links
-
-    if not base_links:
+    links = await LINKS.read()
+    if not links:
         await update.message.reply_text(
             "⚠️ لا توجد روابط تفعيل متاحة حالياً."
             f"{CFG.signature}",
@@ -902,19 +678,88 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # إنشاء / إعادة ضبط الجلسة
-    user_sessions[user_id] = {
-        "working_links": base_links,
-        "current_index": user_sessions.get(user_id, {}).get("current_index", 0),
-        "active_code": code,
-        "timeout_task": None,
-    }
+    start_time = time.time()
+    total = len(links)
+    status_msg = await update.message.reply_text(
+        generate_progress_bar(5, False, 1, total, 0),
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
-    # إذا انتهت القائمة السابقة أعد المؤشر للصفر
-    if user_sessions[user_id]["current_index"] >= len(base_links):
-        user_sessions[user_id]["current_index"] = 0
+    progress = ProgressEditor(status_msg, start_time)
+    typing_task = asyncio.create_task(_keep_typing(context, update.effective_chat.id))
 
-    await process_batch_activation(update, context, user_id)
+    success = False
+    used_link = ""
+
+    try:
+        for idx, link in enumerate(links, start=1):
+            result = await try_activate_tv(
+                link, code, progress, start_time, idx, total,
+                take_screenshot=False,
+            )
+            if result.success:
+                success = True
+                used_link = link
+                break
+            log.info(
+                "attempt %d/%d failed on %s: %s (status=%s)",
+                idx, total, link, result.reason, result.http_status,
+            )
+            if idx < total:
+                await progress(
+                    int((idx / total) * 100),
+                    False,
+                    start_time,
+                    idx + 1,
+                    total,
+                )
+                await asyncio.sleep(0.6)
+    except Exception:
+        log.exception("Unhandled error in /login")
+    finally:
+        typing_task.cancel()
+
+    elapsed = int(time.time() - start_time)
+
+    # إنشاء أزرار التأكيد دائماً عند اكتمال الفحص (100%)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ تم التفعيل",
+                    callback_data=f"confirm_ok|{user_id}|{used_link}",
+                ),
+                InlineKeyboardButton(
+                    "❌ لم يتم التفعيل",
+                    callback_data=f"confirm_fail|{user_id}|{used_link}",
+                ),
+            ]
+        ]
+    )
+
+    final_text = generate_progress_bar(100, True, total, total, elapsed) + CFG.signature
+
+    try:
+        await status_msg.edit_text(
+            final_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+        )
+    except BadRequest as e:
+        log.warning("Could not attach keyboard to message: %s", e)
+        await update.message.reply_text(
+            final_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+        )
+
+    # تشغيل مؤقت الحظر (3 دقائق) في حال لم يتفاعل المستخدم
+    context.job_queue.run_once(
+        auto_ban_job,
+        when=CFG.confirm_timeout_seconds,
+        data={
+            "user_id": user_id,
+            "msg_id": status_msg.message_id,
+            "chat_id": status_msg.chat_id,
+        },
+        name=f"ban_{user_id}_{status_msg.message_id}",
+    )
 
 
 async def _keep_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -928,6 +773,9 @@ async def _keep_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None
         return
 
 
+# =====================================================================
+# Button Callbacks
+# =====================================================================
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -945,41 +793,75 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if query.from_user.id != target_user_id:
-        await query.answer("⛔️ هذه الأزرار خاصة بالمستخدم صاحب الطلب فقط!", show_alert=True)
+        await query.answer("⛔️ هذه الأزرار خاصة بالمستخدم الذي طلب التفعيل فقط!", show_alert=True)
         return
 
-    # إيقاف مؤقت الحظر عند الضغط
-    session = user_sessions.get(target_user_id)
-    if session and session.get("timeout_task"):
-        session["timeout_task"].cancel()
+    # إزالة مؤقت الحظر التلقائي فور تفاعل المستخدم
+    for job in context.job_queue.get_jobs_by_name(f"ban_{target_user_id}_{query.message.message_id}"):
+        job.schedule_removal()
 
-    if action == "status_success":
+    if action == "confirm_ok":
         def _inc(data: dict[str, Any]) -> None:
-            stats = data["link_stats"].setdefault(used_link, {"success": 0, "fail": 0})
-            stats["success"] = stats.get("success", 0) + 1
+            if used_link:
+                stats = data["link_stats"].setdefault(used_link, {"success": 0, "fail": 0})
+                stats["success"] = stats.get("success", 0) + 1
 
         await DATA.update(_inc)
-        user_sessions.pop(target_user_id, None)
         await query.edit_message_text(
-            f"🎉 *تم تأكيد التفعيل بنجاح!*\nنتمنى لك مشاهدة ممتعة. 🍿"
+            f"🎉 *رائع جداً! تم تسجيل نجاح التفعيل.*\n\n"
+            f"📸 يرجى الآن **مشاركة صورة (Screenshot)** لشاشة التلفاز لتأكيد العملية بشكل نهائي."
             f"{CFG.signature}",
             parse_mode=ParseMode.MARKDOWN,
         )
 
-    elif action == "status_failed":
+    elif action == "confirm_fail":
         def _inc(data: dict[str, Any]) -> None:
-            stats = data["link_stats"].setdefault(used_link, {"success": 0, "fail": 0})
-            stats["fail"] = stats.get("fail", 0) + 1
+            if used_link:
+                stats = data["link_stats"].setdefault(used_link, {"success": 0, "fail": 0})
+                stats["fail"] = stats.get("fail", 0) + 1
 
         await DATA.update(_inc)
         await query.edit_message_text(
-            "❌ *تم تسجيل عدم التفعيل.*\n\n"
-            "يرجى **إعادة إرسال الكود** من جديد لفحص الدفعة التالية من الروابط الشغالة."
+            f"❌ *تم تسجيل عدم التفعيل.*\n\n"
+            f"🔄 يرجى **إعادة إرسال الكود مرة ثانية** ليتسنى لنا فحص الروابط أو الدفعة التالية."
             f"{CFG.signature}",
             parse_mode=ParseMode.MARKDOWN,
         )
 
 
+async def auto_ban_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    job_data = context.job.data
+    user_id = job_data["user_id"]
+    chat_id = job_data["chat_id"]
+    msg_id = job_data["msg_id"]
+
+    def _ban(data: dict[str, Any]) -> None:
+        data["temp_banned"][str(user_id)] = time.time() + CFG.ban_duration_seconds
+
+    await DATA.update(_ban)
+
+    text = (
+        "🚫 *تم حظر هذا الحساب تلقائياً لمدة 5 أيام.*\n\n"
+        "السبب: عدم التفاعل مع البوت واختيار النتيجة خلال المهلة المحددة (3 دقائق)."
+        f"{CFG.signature}"
+    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id, text=text, parse_mode=ParseMode.MARKDOWN
+        )
+    except BadRequest as e:
+        if "not modified" in str(e).lower():
+            return
+        log.warning("Could not edit banned message: %s", e)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            log.exception("Failed to notify user about auto-ban.")
+
+
+# =====================================================================
+# Additional Commands & Document Handler
+# =====================================================================
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != CFG.admin_id:
         await update.message.reply_text("⛔️ هذا الأمر مخصص للأدمن فقط.")
@@ -993,17 +875,26 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     code = context.args[0].strip()
+    if not code.isdigit():
+        await update.message.reply_text("⚠️ الكود يجب أن يكون أرقاماً فقط.")
+        return
+
     links = await LINKS.read()
     if not links:
         await update.message.reply_text("⚠️ لا توجد روابط للاختبار.")
         return
 
-    status = await update.message.reply_text("🔍 جاري تنفيذ تجربة وتسجيل screenshot...")
+    status = await update.message.reply_text(
+        "🔍 جاري تنفيذ محاولة واحدة وتسجيل screenshot...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
     progress = ProgressEditor(status, time.time())
     link = links[0]
 
     result = await try_activate_tv(
-        link, code, progress, time.time(), 1, 1, take_screenshot=True
+        link, code, progress, time.time(), 1, 1,
+        take_screenshot=True,
     )
 
     report = (
@@ -1011,7 +902,6 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "───────────────────\n"
         f"🔗 *الرابط:* `{link}`\n"
         f"🔑 *الكود:* `{code}`\n"
-        f"🌐 *شغال:* `{'نعم' if result.is_working else 'لا'}`\n"
         f"📊 *HTTP Status:* `{result.http_status}`\n"
         f"🌐 *URL النهائي:* `{result.final_url}`\n"
         f"📝 *السبب:* `{result.reason}`\n"
@@ -1040,7 +930,6 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     links = await LINKS.read()
     link_stats = data.get("link_stats", {})
     temp_banned = data.get("temp_banned", {})
-    working_links = data.get("working_links", [])
 
     total_success = sum(s.get("success", 0) for s in link_stats.values())
     total_fail = sum(s.get("fail", 0) for s in link_stats.values())
@@ -1050,8 +939,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     header = (
         "📈 *إحصائيات البوت الشاملة*\n"
         "───────────────────\n\n"
-        f"🔗 *إجمالي الروابط العامة:* `{len(links)}`\n"
-        f"⭐ *الروابط الشغالة المحفوظة:* `{len(working_links)}`\n"
+        f"🔗 *إجمالي الروابط:* `{len(links)}`\n"
         f"✅ *التفعيلات الناجحة:* `{total_success}`\n"
         f"❌ *التفعيلات الفاشلة:* `{total_fail}`\n"
         f"🎯 *نسبة النجاح:* `{success_rate:.1f}%`\n"
@@ -1063,17 +951,29 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for idx, link in enumerate(links, start=1):
             s = link_stats.get(link, {}).get("success", 0)
             f = link_stats.get(link, {}).get("fail", 0)
-            is_w = "⭐" if link in working_links else "🔹"
-            body_lines.append(f"{is_w} *رابط {idx}:* `{s}` نجاح | `{f}` فشل")
+            body_lines.append(f"🔹 *رابط {idx}:* `{s}` نجاح | `{f}` فشل")
     else:
         body_lines.append("⚠️ لا توجد روابط مسجلة حالياً.")
 
     full = header + "\n".join(body_lines) + CFG.signature
+
     if len(full) <= 4000:
         await update.message.reply_text(full, parse_mode=ParseMode.MARKDOWN)
         return
 
     await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN)
+    chunk: list[str] = []
+    cur_len = 0
+    for line in body_lines:
+        if cur_len + len(line) + 1 > 3800 and chunk:
+            await update.message.reply_text("\n".join(chunk), parse_mode=ParseMode.MARKDOWN)
+            chunk, cur_len = [], 0
+        chunk.append(line)
+        cur_len += len(line) + 1
+    if chunk:
+        await update.message.reply_text(
+            "\n".join(chunk) + CFG.signature, parse_mode=ParseMode.MARKDOWN
+        )
 
 
 async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1114,6 +1014,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("⚠️ يرجى رفع ملف بصيغة `.txt` فقط.")
         return
 
+    if document.file_size and document.file_size > 5 * 1024 * 1024:
+        await update.message.reply_text("⚠️ حجم الملف يتجاوز 5MB.")
+        return
+
     src_path = Path("temp_links.txt")
     try:
         tg_file = await context.bot.get_file(document.file_id)
@@ -1125,21 +1029,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("⚠️ تعذّر قراءة الملف.")
         return
     finally:
-        if src_path.exists():
-            src_path.unlink()
+        try:
+            if src_path.exists():
+                src_path.unlink()
+        except OSError:
+            pass
 
     if not new_links:
         await update.message.reply_text("⚠️ الملف المرفوع فارغ.")
         return
 
-    # تحديث الملف والروابط الشغالة
     await LINKS.write(new_links)
-
-    def _reset_working(data: dict[str, Any]) -> None:
-        data["working_links"] = new_links.copy()
-
-    await DATA.update(_reset_working)
-
     await update.message.reply_text(
         f"✅ *تم تحديث قائمة الروابط بنجاح!*\nعدد الروابط المتاحة: *{len(new_links)}*"
         f"{CFG.signature}",
@@ -1148,7 +1048,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # =====================================================================
-# Main Application Lifecycle
+# Main
 # =====================================================================
 async def post_init(app: Application) -> None:
     await PW.start()
