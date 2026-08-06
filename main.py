@@ -2,7 +2,7 @@
 LanGoos TV Activation Bot
 =========================
 Telegram bot (python-telegram-bot v20+) + Playwright (Chromium) for
-automatic TV activation through configurable links.
+automatic TV activation through configurable links in batches of 10.
 
 Author: LanGoos
 """
@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,15 +62,16 @@ class Config:
     token: str
     admin_id: int
 
+    batch_size: int = 10
+    confirm_timeout_seconds: int = 180
+    ban_duration_seconds: int = 5 * 24 * 3600
+
     links_file: Path = Path("links.txt")
     data_file: Path = Path("bot_data.json")
     used_links_file: Path = Path("used_links.txt")
     screenshots_dir: Path = Path("screenshots")
 
     signature: str = "\n\n🌐 *By: LanGoos*"
-
-    confirm_timeout_seconds: int = 180         # 3 دقائق مهلة الانتظار
-    ban_duration_seconds: int = 5 * 24 * 3600  # حظر 5 أيام عند عدم التفاعل
 
     progress_min_interval: float = 1.5
 
@@ -80,11 +82,9 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        default_token = "8777412311:AAEW32qe5Tf_X-5jpEH5PIMz8DYrinHVQOg"
-        default_admin_id = "6243526869"
-
-        token = os.getenv("BOT_TOKEN", default_token).strip()
-        admin_id_raw = os.getenv("ADMIN_ID", default_admin_id).strip()
+        # ⚠️ إزالة القيم الافتراضية الحساسة - يجب تعيينها عبر متغيرات البيئة
+        token = os.getenv("BOT_TOKEN", "").strip()
+        admin_id_raw = os.getenv("ADMIN_ID", "").strip()
 
         if not token:
             raise RuntimeError("❌ BOT_TOKEN is not configured.")
@@ -100,7 +100,7 @@ CFG.screenshots_dir.mkdir(parents=True, exist_ok=True)
 
 
 # =====================================================================
-# Data & Link Store Management
+# Data Store & Link Store
 # =====================================================================
 class DataStore:
     DEFAULT: dict[str, Any] = {
@@ -166,26 +166,24 @@ class LinkStore:
                 return []
 
     async def consume_link(self, link_to_remove: str) -> None:
-        """حذف الرابط المستخدَم من القائمة الرئيسية وتسجيله في الروابط المستعملة"""
+        """حذف الرابط المستخدَم من القائمة الرئيسية لعدم إعطائه لمستخدم آخر"""
         async with self._lock:
             if not self.main_path.exists():
                 return
 
-            # قراءة الروابط الموجودة
             with self.main_path.open("r", encoding="utf-8") as f:
                 links = [ln.strip() for ln in f if ln.strip()]
 
-            # تصفية الرابط المفعل
-            updated_links = [l for l in links if l != link_to_remove]
+            # إصلاح: التطبيع قبل المقارنة لتجنب اختلافات الـ trailing slash
+            normalized_target = _normalize_url(link_to_remove)
+            updated_links = [l for l in links if _normalize_url(l) != normalized_target]
 
-            # إعادة كتابة الملف الرئيسي بالروابط المتبقية فقط
             tmp = self.main_path.with_suffix(self.main_path.suffix + ".tmp")
             with tmp.open("w", encoding="utf-8") as f:
                 for ln in updated_links:
                     f.write(f"{ln}\n")
             os.replace(tmp, self.main_path)
 
-            # إضافة الرابط لملف الروابط المستعملة للتأرشيف
             with self.used_path.open("a", encoding="utf-8") as f:
                 f.write(f"{link_to_remove}\n")
 
@@ -244,14 +242,14 @@ def generate_progress_bar(
     status_icon = "✅" if is_done else "⏳"
 
     return (
-        "⏳ *جاري فحص دفعة التفعيل...*\n\n"
+        f"⏳ *جاري فحص دفعة التفعيل ({total} روابط)...*\n\n"
         f"`[{bar}]` *{percent}%*\n\n"
         f"📌 *الحالة:* {status_icon}\n"
-        f"🔗 *الرابط الحالي:* {current_idx} من {total}\n"
+        f"🔗 *الرابط الحالي في الدفعة:* {current_idx} من {total}\n"
         f"⏱ *الوقت المنقضي:* {elapsed_sec} ثانية\n"
         "───────────────────\n"
         "⚠️ *تعليمات مهمة:*\n"
-        "1️⃣ عند نجاح التفعيل، يرجى التأكيد خلال *3 دقائق* فقط.\n"
+        "1️⃣ عند ظهور الأزرار، يرجى التأكيد خلال *3 دقائق* فقط.\n"
         "2️⃣ *التجاهل سيؤدي لحظر حسابك تلقائياً لمدة 5 أيام!*"
     )
 
@@ -285,7 +283,7 @@ FAILURE_MARKERS_EN = (
 
 
 def _normalize_url(u: str) -> str:
-    p = urlparse(u)
+    p = urlparse(u.strip())
     return urlunparse((p.scheme, p.netloc, p.path.rstrip("/"), p.params, p.query, ""))
 
 
@@ -438,6 +436,7 @@ async def try_activate_tv(
         )
 
         async with PW.new_page() as (_ctx, page):
+            # إصلاح: تسجيل الـ listener وإزالته لاحقاً لتجنب تسرب الذاكرة
             page.on("response", _capture_response)
 
             try:
@@ -607,21 +606,24 @@ class ProgressEditor:
         self._last_edit_ts: float = 0.0
         self._pending: Optional[tuple[int, bool, int, int]] = None
         self._task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
 
     async def __call__(self, percent: int, is_done: bool, s_time: float, acc_idx: int, total: int) -> None:
-        now = time.time()
-        self._pending = (percent, is_done, acc_idx, total)
-        if now - self._last_edit_ts >= CFG.progress_min_interval:
-            await self._flush()
-        else:
-            if self._task is None or self._task.done():
-                self._task = asyncio.create_task(self._delayed_flush())
+        async with self._lock:
+            self._pending = (percent, is_done, acc_idx, total)
+            now = time.time()
+            if now - self._last_edit_ts >= CFG.progress_min_interval:
+                await self._flush()
+            else:
+                if self._task is None or self._task.done():
+                    self._task = asyncio.create_task(self._delayed_flush())
 
     async def _delayed_flush(self) -> None:
         try:
             await asyncio.sleep(CFG.progress_min_interval)
-            if self._pending is not None:
-                await self._flush()
+            async with self._lock:
+                if self._pending is not None:
+                    await self._flush()
         except asyncio.CancelledError:
             pass
 
@@ -696,9 +698,8 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # قراءة الروابط النشطة فقط
-    links = await LINKS.read_active_links()
-    if not links:
+    all_links = await LINKS.read_active_links()
+    if not all_links:
         await update.message.reply_text(
             "⚠️ لا توجد روابط تفعيل متاحة حالياً (تم استهلاك جميع الروابط)."
             f"{CFG.signature}",
@@ -706,10 +707,12 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    batch_links = all_links[: CFG.batch_size]
+    total_in_batch = len(batch_links)
+
     start_time = time.time()
-    total = len(links)
     status_msg = await update.message.reply_text(
-        generate_progress_bar(5, False, 1, total, 0),
+        generate_progress_bar(5, False, 1, total_in_batch, 0),
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -720,9 +723,9 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     used_link = ""
 
     try:
-        for idx, link in enumerate(links, start=1):
+        for idx, link in enumerate(batch_links, start=1):
             result = await try_activate_tv(
-                link, code, progress, start_time, idx, total,
+                link, code, progress, start_time, idx, total_in_batch,
                 take_screenshot=False,
             )
             if result.success:
@@ -730,16 +733,16 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 used_link = link
                 break
             log.info(
-                "attempt %d/%d failed on %s: %s (status=%s)",
-                idx, total, link, result.reason, result.http_status,
+                "attempt %d/%d in batch failed on %s: %s (status=%s)",
+                idx, total_in_batch, link, result.reason, result.http_status,
             )
-            if idx < total:
+            if idx < total_in_batch:
                 await progress(
-                    int((idx / total) * 100),
+                    int((idx / total_in_batch) * 100),
                     False,
                     start_time,
                     idx + 1,
-                    total,
+                    total_in_batch,
                 )
                 await asyncio.sleep(0.6)
     except Exception:
@@ -749,7 +752,22 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     elapsed = int(time.time() - start_time)
 
-    # إنشاء الأزرار فوراً عند اكتمال نسبة التقدم 100%
+    # إصلاح: إذا فشلت جميع المحاولات، نعرض رسالة فشل بدون أزرار
+    if not success:
+        final_text = (
+            "❌ *لم يتم التفعيل في هذه الدفعة.*\n\n"
+            f"🔗 *تم فحص:* {total_in_batch} روابط\n"
+            f"⏱ *الوقت المنقضي:* {elapsed} ثانية\n\n"
+            f"🔄 يرجى **إعادة إرسال الكود** لمحاولة دفعة جديدة."
+            f"{CFG.signature}"
+        )
+        try:
+            await status_msg.edit_text(final_text, parse_mode=ParseMode.MARKDOWN)
+        except BadRequest:
+            await update.message.reply_text(final_text, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # عرض الأزرار فقط عند النجاح
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -765,7 +783,10 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ]
     )
 
-    final_text = generate_progress_bar(100, True, total, total, elapsed) + CFG.signature
+    final_text = (
+        generate_progress_bar(100, True, total_in_batch, total_in_batch, elapsed)
+        + CFG.signature
+    )
 
     try:
         await status_msg.edit_text(
@@ -777,7 +798,7 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             final_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
         )
 
-    # جدولة دالة الحظر التلقائي بعد 3 دقائق عند عدم التفاعل
+    # جدولة مؤقت الحظر التلقائي بعد 3 دقائق عند التجاهل
     context.job_queue.run_once(
         auto_ban_job,
         when=CFG.confirm_timeout_seconds,
@@ -824,12 +845,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("⛔️ هذه الأزرار خاصة بالمستخدم الذي طلب التفعيل فقط!", show_alert=True)
         return
 
-    # إلغاء المؤقت فور الضغط على أي زر
-    for job in context.job_queue.get_jobs_by_name(f"ban_{target_user_id}_{query.message.message_id}"):
+    # إزالة مؤقت الحظر التلقائي فور تفاعل المستخدم مع الأزرار
+    job_name = f"ban_{target_user_id}_{query.message.message_id}"
+    for job in context.job_queue.get_jobs_by_name(job_name):
         job.schedule_removal()
 
     if action == "confirm_ok":
-        # عند تأكيد نجاح التفعيل: نحذف الرابط المستعمل حتى لا يتكرر لغيره
         if used_link:
             await LINKS.consume_link(used_link)
 
@@ -855,8 +876,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         await DATA.update(_inc)
         await query.edit_message_text(
-            f"❌ *تم تسجيل عدم التفعيل.*\n\n"
-            f"🔄 يرجى **إعادة إرسال الكود مرة ثانية** ليتسنى لنا فحص الروابط المتاحة التالية."
+            f"❌ *تم تسجيل عدم التفعيل لهذه الدفعة.*\n\n"
+            f"🔄 يرجى **إعادة إرسال الكود مرة ثانية** للبدء في فحص الدفعة الـ 10 التالية من الروابط."
             f"{CFG.signature}",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -1051,7 +1072,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("⚠️ حجم الملف يتجاوز 5MB.")
         return
 
-    src_path = Path("temp_links.txt")
+    # إصلاح: استخدام اسم ملف فريد لتجنب التعارض بين الطلبات المتزامنة
+    src_path = Path(f"temp_links_{uuid.uuid4().hex}.txt")
     try:
         tg_file = await context.bot.get_file(document.file_id)
         await tg_file.download_to_drive(str(src_path))
